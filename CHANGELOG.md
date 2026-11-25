@@ -1,10 +1,156 @@
 # Changelog
 
+
+## 6.15.1
+
+- Fix the CocoaPods build of `OptimoveSDK` failing on `UNAuthorizationStatus.provisional` (iOS 11 deployment target). `OptimoveSDK` 6.15.0 was not published to CocoaPods; use 6.15.1.
+
+## 6.15.0
+
+- Push: the SDK now always registers a push token, whatever the notification permission (like the Android SDK), so silent pushes can reach users who haven't allowed notifications. `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)` therefore now fires for users who denied, or haven't yet granted, permission; apps that assume a token means permission should check it themselves. `pushUnregister()` is still a full opt-out.
+- Add `OptimoveOverlayMessaging.setClosedListener(_:)` — register an `OverlayClosedListener` closure that is called when an overlay leaves the screen. It fires once for every presented message with an `OverlayCloseReason`: `.actioned` (the user interacted with the message, e.g. tapped an action button), `.dismissed` (closed without interacting: close button, backdrop tap) or `.error` (presentation failed). `hide()` is not a close, and messages the interceptor defers or discards never fire. This is an observer only, separate from `setActionHandler`; it cannot block or override a close.
+- Fix an overlay that failed to resolve the IAR URL staying in the queue forever and blocking later overlays. It is now treated as a presentation error.
+- Fix a repeated close or error report for the same overlay (e.g. a web view load failure followed by a content process termination) dropping the next queued overlay before it was shown.
+
+## 6.14.0
+
+- Add Live Activities (iOS 18+). Call `enableLiveActivities(YourAttributes.self)` on the config builder after conforming the host `ActivityAttributes` type to `OptimoveLiveActivityAttributes` in the app target (not the widget). The SDK reports `k.liveActivity.pushToStartTokenRegistered` and `k.liveActivity.started` (the latter only when `optimoveActivityId` is set). ActivityKit is weakly linked.
+
+## 6.13.0
+
+- Gamify: the optional `gamify` block of the tenant configuration (`adactUrl`, `loyaltyWidgetUrl`) is now parsed and applied, so neither URL is hardcoded by the host app.
+- Gamify: federated auth for the loyalty widget. New `GamifyWidgetSDK.openWidget(from:params:)` opens `{loyaltyWidgetUrl}/{tenantId}[/brand/{brand}]/{userId}`, defaulting to the identified SDK user. When `enableAuth()` is used, a JWT for that user is fetched from the `AuthTokenProvider` and passed in the widget's INIT message; if the token can't be fetched the widget closes instead of opening unauthenticated.
+- Deprecated `GamifyWidgetSDK.initialize(widgetUrl:adactUrl:)` and `open(from:userId:token:)`. Both URLs come from the tenant configuration and the token from the `AuthTokenProvider`; use `openWidget(from:params:)` for the loyalty widget, and `openAdactCampaign(from:params:)` needs no setup. Until removed, `open` opens the URL passed to `initialize` as given (or the tenant-configured widget if `initialize` was not called) and ignores its `token` argument; federated auth applies. An `adactUrl` passed to `initialize` is used only when the tenant configuration has none.
+
+## 6.12.1
+
+- Fix in-app and overlay messages ignoring the host app's supported orientations. The message window now uses the orientations of the host's top view controller at the time the message is shown, so an orientation-restricted app (e.g. landscape-only) no longer rotates while a message is displayed.
+
+## 6.12.0
+
+- Add `OptimoveOverlayMessaging.hide()` / `show()` — temporarily take a displayed overlay off screen and restore it in place, for hosts that need the screen for a higher-priority popup of their own. The message resumes where it was, with no re-trigger and no second interceptor call. Messages arriving while hidden are held until `show()`.
+
+## 6.11.0
+
+- Add federated JWT authentication support. Use `enableAuth()` on the config builder to supply a token provider. The SDK attaches `X-User-JWT` to all user-identified requests (OptiTrack, RealTime, PreferenceCenter, EmbeddedMessaging, AnalyticsHelper, InAppManager).
+- Add `X-Optimove-Auth-Capable: 1` header to all requests to signal auth-capable SDK versions to backends.
+- Fix multi-customer event batching: OptiTrack/RealTime now group events by customer identity so each request carries a single valid JWT. AnalyticsHelper fetches events per user to ensure JWT matches the batch.
+
+## 6.10.0
+
+- Add Adact campaign support to `GamifyWidgetSDK`: `initialize(widgetUrl:adactUrl:)`, `openAdactCampaign(from:params:)`, `closeAdactCampaign()`, `closeWidget()`, and `buildAdactCampaignUrl(params:)`. Opens `{adactUrl}/embedded/{campaignId}` with optional `cid` and `customerIdToken` query params (same contract as the Web / Android SDKs). Adact does not use the loyalty READY→INIT handshake.
+
+## 6.9.0
+
+- Add `OptimoveConfigBuilder.enableOverlayMessaging(sessionLengthMinutes:)` overload to configure the overlay messaging session window in minutes (minimum 15). The existing `enableOverlayMessaging(sessionLengthHours:)` overload is unchanged.
+
+## 6.8.0
+
+- Add `OptimoveOverlayMessaging.setActionHandler(_:)` — register a handler to intercept overlay CTA clicks and perform custom navigation instead of the SDK opening the URL.
+
+## 6.7.0
+
+- Add Gamify Widget SDK — `GamifyWidgetSDK.initialize(widgetUrl:)` and `GamifyWidgetSDK.open(from:userId:token:)` present the widget in a modal `WKWebView` with a JS bridge for `READY` / `INIT` / `CLOSE` handshakes.
+
+## 6.6.0
+
+- Implementation for Overlay Messaging channel. Check optimove developer docs for more.
+
+## 6.5.0
+
+- Add `postpone()` to the In-App Message Interceptor API. When called, the message is not displayed and not marked as dismissed — it is moved to the back of the queue and will be re-intercepted on the next natural presentation trigger (e.g. app foreground, push tickle). Existing `show()` and `suppress()` behavior is unchanged.
+- Fix dismissed non-inbox in-app messages reappearing after app reopen due to race between local DB cleanup and backend sync. Dismissed rows are now kept for 1 hour before eviction.
+
+## 6.4.1
+
+- Correct parsing of Embedded Messaging V2 endpoint response
+
+## 6.4.0
+
+- Update delayed configuration to no longer require a redundant region parameter. Region is now inferred from credentials. Deprecated `OptimoveConfigBuilder.init(region:features:)` — use `init(features:)` instead.
+
+## 6.3.0
+
+- Add In-App Message Interceptor API `OptimoveInApp.setInAppMessageInterceptor(_:)` to allow apps to control when in-app messages are shown or suppressed based on custom logic. If no decision is made within the timeout (default 5s), the message is automatically suppressed.
+
+## 6.2.6
+
+- Remove semaphore wait in session end to avoid QoS inversion during background flush
+
+## 6.2.5
+
+- Update storage directory helpers: `optimoveURL()` uses Application Support with Caches/temp fallback and `temporaryURL()` returns system temp; no directory creation.
+
+## 6.2.4
+
+- Updated Embedded Messages to use the V2 endpoints
+
+## 6.2.3
+
+- Fix potential crash when handling push notifications due to method swizzling target resolution in apps using delegate forwarding patterns (such as Flutter)
+
+## 6.2.2
+
+- Add the Embedded messaging APIs for GetMessages, Mark as Read, Send metrics
+
+## 6.2.1
+
+- Resolve issue where images with query parameters in dynamic image URLs were not displaying correctly
+
+## 6.2.0
+
+- Add support for coexisting with other push notification SDKs by resolving race conditions when multiple SDKs swizzle the following UIApplicationDelegate methods:
+  - `UIApplicationDelegate.application(:didRegisterForRemoteNotificationsWithDeviceToken:)`
+  - `UIApplicationDelegate.application(:didFailToRegisterForRemoteNotificationsWithError:)`
+  - `UIApplicationDelegate.application(_:didReceiveRemoteNotification:fetchCompletionHandler:)`
+- Fix swizzling forwarding for apps that use UIApplicationDelegateAdaptor
+
+## 6.1.0
+
+- Fix invalidating sessions on NetworkClientImpl deinit
+- Fix removed tasks to support pre 5.5 swift versions
+- Fix Xcode 16 OpitmoveSDK warnings
+
+## 6.0.2
+
+- Fix same immediate events sent multiple times
+
+## 6.0.1
+
+- Fix in app presentation issue in orientation change
+
+## 6.0.0
+
+- Add Preference Center feature. The new functionality is available through the following methods:
+  - `OptimovePreferenceCenter.getInstance().setCustomerPreferencesAsync()`
+  - `OptimovePreferenceCenter.getInstance().getPreferencesAsync()`
+
+Breaking changes:
+
+- iOS 13 required for using Preference Center
+- removed `OptimoveConfigBuilder.setCredentials` unintentionally public method
+
+## 5.9.0
+
+- Remove `SetUserAgent` event
+
+## 5.8.0
+
+- Add a new public API `Optimove.shared.urlOpened(url: url)` to allow easily forwarding urls to Optimove instead of relying on AppDeletegate's `application(_:continue:restorationHandler:)`
+- Fix deeplink decoding issue
+- Fix immediate initialization of the SDK
+
+## 5.7.0
+
+- Add Privacy Manifest
+- Fix explicit `self` for `weak self` captures to allow pre 5.8 Swift compilation
+- Remove web to app banner code
+
 ## 5.6.0
 
 - Support the delayed configuration for SDK. Add new public APIs:
-    - `OptimoveConfigBuilder(region: Region, features: [Feature])` - call for creating delayed configuration builder.
-    - `Optimove.setCredentials(optimoveCredentials: String?, optimobileCredentials: String?)` - call for setting credentials for delayed configuration.
+  - `OptimoveConfigBuilder(region: Region, features: [Feature])` - call for creating delayed configuration builder.
+  - `Optimove.setCredentials(optimoveCredentials: String?, optimobileCredentials: String?)` - call for setting credentials for delayed configuration.
 
 ## 5.5.0
 

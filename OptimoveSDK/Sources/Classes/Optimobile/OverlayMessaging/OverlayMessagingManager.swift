@@ -1,0 +1,281 @@
+//  Copyright © 2025 Optimove. All rights reserved.
+
+import Foundation
+
+class OverlayMessagingManager {
+    
+    private static let sessionSlotCapacity = 1
+    private static let immediateSlotCapacity = 1
+    
+    private var sessionSlotCount = 0
+    private var immediateSlotCount = 0
+    
+    private var displayQueue: [OverlayMessagingMessage] = []
+    private let requestService: OverlayMessagingRequestService
+    private let urlBuilder: UrlBuilder
+    private var interceptor: OverlayMessagingInterceptor?
+    private let actionDispatcher = OverlayActionDispatcher(defaults: DefaultOverlayActionHandler())
+    private var closedListener: OverlayClosedListener?
+    private var presenter: OverlayMessagingPresenter?
+    private var hidden = false
+    // Prevents showing the same message twice if triggers fire in quick succession
+    // (after slot cleared but before backend state updates)
+    private var seenMessageIds = Set<Int64>()
+    
+    init(httpClient: KSHttpClient, urlBuilder: UrlBuilder) {
+        requestService = OverlayMessagingRequestService(httpClient: httpClient)
+        self.urlBuilder = urlBuilder
+    }
+    
+    // MARK: - Interceptor
+    
+    func setInterceptor(_ interceptor: OverlayMessagingInterceptor?) {
+        self.interceptor = interceptor
+    }
+
+    func setActionHandler(_ handler: OverlayActionHandler?) {
+        actionDispatcher.setOverrides(handler)
+    }
+
+    func setClosedListener(_ listener: OverlayClosedListener?) {
+        closedListener = listener
+    }
+
+    // MARK: - Visibility
+
+    func setHidden(_ hidden: Bool) {
+        guard self.hidden != hidden else { return }
+        self.hidden = hidden
+
+        if hidden {
+            presenter?.setHidden(true)
+        } else {
+            maybeShowNext()
+            presenter?.setHidden(false)
+        }
+    }
+    
+    // MARK: - Triggers
+    
+    func onTriggerReceived(_ type: OverlayMessagingMessage.MessageType) {
+        
+        switch type {
+        case .session:
+            guard sessionSlotCount < Self.sessionSlotCapacity else {
+                return
+            }
+            sessionSlotCount += 1
+            loadMessage(type)
+        case .immediate:
+            guard immediateSlotCount < Self.immediateSlotCapacity else {
+                return
+            }
+            immediateSlotCount += 1
+            loadMessage(type)
+        }
+    }
+    
+    // MARK: - Slots
+    
+    private func onSlotCleared(_ type: OverlayMessagingMessage.MessageType) {
+        switch type {
+        case .session:
+            sessionSlotCount = max(0, sessionSlotCount - 1)
+        case .immediate:
+            immediateSlotCount = max(0, immediateSlotCount - 1)
+        }
+    }
+    
+    // MARK: - Loading
+    
+    private func loadMessage(_ type: OverlayMessagingMessage.MessageType) {
+        requestService.readOverlayMessage(type: type) { message in
+            DispatchQueue.main.async {
+                self.onMessageLoaded(type: type, message: message)
+            }
+        }
+    }
+    
+    private func onMessageLoaded(type: OverlayMessagingMessage.MessageType, message: OverlayMessagingMessage?) {
+        guard let message = message else {
+            onSlotCleared(type)
+            return
+        }
+        guard !seenMessageIds.contains(message.id) else {
+            onSlotCleared(type)
+            return
+        }
+        seenMessageIds.insert(message.id)
+        processMessage(message)
+    }
+    
+    // MARK: - Processing
+    
+    private func processMessage(_ message: OverlayMessagingMessage) {
+        guard let interceptor = interceptor else {
+            displayQueue.append(message)
+            maybeShowNext()
+            return
+        }
+        
+        let callback = InterceptorCallback { [weak self] outcome in
+            self?.handleInterceptorOutcome(message: message, outcome: outcome)
+        }
+        
+        let timeoutMs = max(0, interceptor.getTimeoutMs())
+        let timeoutItem = DispatchWorkItem {
+            callback.timeout()
+        }
+        
+        callback.setCancelTimeout { timeoutItem.cancel() }
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(timeoutMs), execute: timeoutItem)
+        
+        interceptor.onMessageLoaded(message, callback: callback)
+    }
+    
+    private func handleInterceptorOutcome(message: OverlayMessagingMessage, outcome: InterceptorOutcome) {
+        switch outcome {
+        case .show:
+            displayQueue.append(message)
+            maybeShowNext()
+        case .deferred, .timeout:
+            seenMessageIds.remove(message.id)
+            onSlotCleared(message.type)
+        case .discard:
+            onSlotCleared(message.type)
+        }
+        trackInterceptedEvent(messageId: message.id, outcome: outcome)
+    }
+    
+    private func trackInterceptedEvent(messageId: Int64, outcome: InterceptorOutcome) {
+        Optimobile.trackEventImmediately(
+            eventType: OptimobileEvent.OM_INTERCEPTED.rawValue,
+            properties: ["id": messageId, "outcome": outcome.eventValue]
+        )
+    }
+    
+    // MARK: - Display
+    
+    private func maybeShowNext() {
+        guard !hidden else { return }
+
+        guard let next = displayQueue.first else {
+            presenter?.dispose()
+            presenter = nil
+            return
+        }
+        
+        if let presenter = presenter {
+            presenter.showMessage(next)
+            return
+        }
+
+        presenter = OverlayMessagingPresenter(
+            message: next,
+            urlBuilder: urlBuilder,
+            delegate: self
+        )
+    }
+    
+    // MARK: - Event tracking
+    
+    private func trackRendererEvents(messageId: Int64, events: [OverlayMessagingRendererEvent]) {
+        for event in events {
+            var props: [String: Any] = event.data.flatMap { $0 as? [String: Any] } ?? [:]
+            props["id"] = messageId
+            Optimobile.trackEvent(
+                eventType: event.type,
+                atTime: Date(),
+                properties: props,
+                immediateFlush: event.immediateFlush
+            )
+        }
+    }
+    
+}
+
+// MARK: - OverlayMessagingPresenterDelegate
+
+extension OverlayMessagingManager: OverlayMessagingPresenterDelegate {
+    
+    func onMessageClosed(_ message: OverlayMessagingMessage, reason: OverlayCloseReason) {
+        guard isFrontOfQueue(message) else { return }
+        displayQueue.removeFirst()
+        onSlotCleared(message.type)
+        closedListener?(message, OverlayClosedInfo(reason: reason))
+        maybeShowNext()
+    }
+
+    func onEvents(_ message: OverlayMessagingMessage, events: [OverlayMessagingRendererEvent]) {
+        trackRendererEvents(messageId: message.id, events: events)
+    }
+
+    func onAction(_ message: OverlayMessagingMessage, action: OverlayAction) {
+        actionDispatcher.dispatch(action, message: message)
+    }
+
+    func onViewError(_ message: OverlayMessagingMessage) {
+        // Checked before disposing: a stale error must not tear down the presenter now showing the next message.
+        guard isFrontOfQueue(message) else { return }
+        presenter?.dispose()
+        presenter = nil
+        // Immediate messages are short-lived. In case of an error we dont want them to stay on queue and surface later
+        displayQueue.removeFirst()
+        onSlotCleared(message.type)
+        closedListener?(message, OverlayClosedInfo(reason: .error))
+        maybeShowNext()
+    }
+
+    /// A presenter can report more than one close or error for the same message (e.g. a navigation
+    /// failure followed by a web content process termination). Only the first one for the message
+    /// at the front of the queue counts; repeats would otherwise drop the next message and free its slot.
+    private func isFrontOfQueue(_ message: OverlayMessagingMessage) -> Bool {
+        displayQueue.first?.id == message.id
+    }
+}
+
+// MARK: - InterceptorOutcome
+
+private enum InterceptorOutcome {
+    case show, discard, deferred, timeout
+    
+    var eventValue: String {
+        switch self {
+        case .show: return "show"
+        case .discard: return "discard"
+        case .deferred: return "defer"
+        case .timeout: return "timeout"
+        }
+    }
+}
+
+// MARK: - InterceptorCallback
+
+private class InterceptorCallback: OverlayMessagingInterceptorCallback {
+    private var resolved = false
+    private var cancelTimeout: (() -> Void)?
+    private let onOutcome: (InterceptorOutcome) -> Void
+    
+    init(onOutcome: @escaping (InterceptorOutcome) -> Void) {
+        self.onOutcome = onOutcome
+    }
+    
+    func setCancelTimeout(_ cancel: @escaping () -> Void) {
+        cancelTimeout = cancel
+    }
+    
+    func show() { resolve(.show) }
+    func discard() { resolve(.discard) }
+    func deferMessage() { resolve(.deferred) }
+    func timeout() { resolve(.timeout) }
+    
+    private func resolve(_ outcome: InterceptorOutcome) {
+        DispatchQueue.main.async {
+            guard !self.resolved else { return }
+            self.resolved = true
+            self.cancelTimeout?()
+            self.onOutcome(outcome)
+        }
+    }
+}

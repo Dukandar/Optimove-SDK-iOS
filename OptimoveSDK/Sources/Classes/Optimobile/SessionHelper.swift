@@ -39,18 +39,34 @@ class SessionHelper {
     private var sessionIdleTimer: SessionIdleTimer?
     private var bgTask: UIBackgroundTaskIdentifier
     private var sessionIdleTimeout: UInt
-    private let syncBarrier = DispatchSemaphore(value: 0)
+    private let trackBackground: (Date, @escaping SyncCompletedBlock) -> Void
+    private let trackForeground: () -> Void
+    private let checkNotificationEnablement: () -> Void
 
-    init(sessionIdleTimeout: UInt) {
+    init(sessionIdleTimeout: UInt,
+         trackForeground: @escaping () -> Void = { Optimobile.trackEvent(eventType: OptimobileEvent.STATS_FOREGROUND, properties: nil) },
+         checkNotificationEnablement: @escaping () -> Void = { Optimobile.reportNotificationEnablementIfChanged() },
+         trackBackground: @escaping (Date, @escaping SyncCompletedBlock) -> Void = { date, done in
+             Optimobile.trackEvent(eventType: OptimobileEvent.STATS_BACKGROUND.rawValue,
+                                   atTime: date,
+                                   properties: nil,
+                                   immediateFlush: true,
+                                   onSyncComplete: done)
+         }) {
         startNewSession = true
         sessionIdleTimer = nil
         bgTask = UIBackgroundTaskIdentifier.invalid
         becameInactiveAt = nil
         self.sessionIdleTimeout = sessionIdleTimeout
+        self.trackBackground = trackBackground
+        self.trackForeground = trackForeground
+        self.checkNotificationEnablement = checkNotificationEnablement
     }
 
     func initialize() {
         registerListeners()
+        // The SDK may be configured after the app's first foreground, so don't wait for the next one.
+        checkNotificationEnablement()
     }
 
     private func registerListeners() {
@@ -66,8 +82,10 @@ class SessionHelper {
     // MARK: App lifecycle delegates
 
     @objc private func appBecameActive() {
+        checkNotificationEnablement()
+
         if startNewSession {
-            Optimobile.trackEvent(eventType: OptimobileEvent.STATS_FOREGROUND, properties: nil)
+            trackForeground()
             startNewSession = false
             return
         }
@@ -111,25 +129,32 @@ class SessionHelper {
         }
     }
 
-    fileprivate func sessionDidEnd() {
+    func sessionDidEnd() {
         guard let sessionEndTime = becameInactiveAt else {
             return
         }
-
+        
         startNewSession = true
         sessionIdleTimer = nil
-
-        Optimobile.trackEvent(eventType: OptimobileEvent.STATS_BACKGROUND.rawValue, atTime: sessionEndTime, properties: nil, immediateFlush: true, onSyncComplete: { _ in
-            self.becameInactiveAt = nil
-
-            if self.bgTask != UIBackgroundTaskIdentifier.invalid {
-                UIApplication.shared.endBackgroundTask(self.bgTask)
-                self.bgTask = UIBackgroundTaskIdentifier.invalid
+        
+        trackBackground(sessionEndTime) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.becameInactiveAt = nil
+                
+                if self.bgTask != UIBackgroundTaskIdentifier.invalid {
+                    UIApplication.shared.endBackgroundTask(self.bgTask)
+                    self.bgTask = UIBackgroundTaskIdentifier.invalid
+                }
             }
-
-            self.syncBarrier.signal()
-        })
-
-        _ = syncBarrier.wait(timeout: .now() + .seconds(3))
+        }
     }
 }
+
+#if DEBUG
+extension SessionHelper {
+    func setBecameInactiveAtForTest(_ date: Date) {
+        becameInactiveAt = date
+    }
+}
+#endif

@@ -23,6 +23,7 @@ public class UrlBuilder {
         case events
         case iar
         case media
+        case overlayMessaging
         case push
     }
 
@@ -52,11 +53,8 @@ public class UrlBuilder {
         }
     }
 
-    required init(storage: KeyValPersistenceHelper.Type, runtimeUrlsMap: ServiceUrlMap? = nil) {
+    required init(storage: KeyValPersistenceHelper.Type) {
         self.storage = storage
-        if let runtimeUrlsMap = runtimeUrlsMap, isValidateUrlMap(urlsMap: runtimeUrlsMap) {
-            self.runtimeUrlsMap = runtimeUrlsMap
-        }
     }
 
     func urlForService(_ service: Service) throws -> URL {
@@ -74,6 +72,7 @@ public class UrlBuilder {
             .events: "https://events-\(region).kumulos.com",
             .iar: "https://iar.app.delivery",
             .media: "https://i-\(region).app.delivery",
+            .overlayMessaging: "https://optimobile-overlay-srv-\(region).optimove.net",
             .push: "https://push-\(region).kumulos.com",
         ]
     }

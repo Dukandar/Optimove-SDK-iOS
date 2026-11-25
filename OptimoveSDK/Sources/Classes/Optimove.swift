@@ -32,12 +32,13 @@ typealias Logger = OptimoveCore.Logger
     }
 
     /// The starting point of the Optimove SDK.
-    static func configure(for config: OptimoveConfig) {
+    static func configure(for config: OptimoveConfig, authManager: AuthManager? = nil) {
         /// FUTURE: To merge configure call with init.
         shared.container.resolve { serviceLocator in
             if let tenantInfo = config.tenantInfo {
                 serviceLocator.newTenantInfoHandler().handle(tenantInfo)
             }
+            serviceLocator.authManager = authManager
             serviceLocator.deviceStateObserver().start()
             shared.startSDK { _ in }
         }
@@ -46,8 +47,10 @@ typealias Logger = OptimoveCore.Logger
     public static func initialize(with config: OptimoveConfig) {
         shared.config = config
 
+        let authManager: AuthManager? = config.authTokenProvider.map { AuthManager(provider: $0) }
+
         if config.isOptimoveConfigured() {
-            Optimove.configure(for: config)
+            Optimove.configure(for: config, authManager: authManager)
         }
 
         if config.isOptimobileConfigured() {
@@ -56,24 +59,87 @@ typealias Logger = OptimoveCore.Logger
                     let visitorId = try serviceLocator.storage().getInitialVisitorId()
                     let userId = try? serviceLocator.storage().getCustomerID()
 
-                    try Optimobile.initialize(config: config, initialVisitorId: visitorId, initialUserId: userId)
+                    try Optimobile.initialize(config: config, initialVisitorId: visitorId, initialUserId: userId, authManager: authManager)
                 } catch {
                     throw GuardError.custom("Failed on OptimobileSDK initialization. Reason: \(error.localizedDescription)")
                 }
             }
         }
+        
+        if config.isEmbeddedMessagingConfigured() {
+            shared.container.resolve { serviceLocator in
+                do {
+                    try EmbeddedMessagesService.initialize(with: config, storage: serviceLocator.storage(), networkClient: NetworkClientImpl(), authManager: authManager)
+                } catch {
+                    throw GuardError.custom("Failed on Embedded Messaging initialization. Reason: \(error.localizedDescription)")
+                }
+            }
+        }
+
+        if config.isPreferenceCenterConfigured() {
+            guard config.isOptimoveConfigured() else {
+                Logger.error("Preference Center requires the optimove feature enabled.")
+                return
+            }
+
+            shared.container.resolve { serviceLocator in
+                do {
+                    try OptimovePreferenceCenter.initialize(with: config, storage: serviceLocator.storage(), networkClient: NetworkClientImpl(), authManager: authManager)
+                } catch {
+                    throw GuardError.custom("Failed on PreferenceCenter initialization. Reason: \(error.localizedDescription)")
+                }
+            }
+        }
+
+        if config.isLiveActivitiesConfigured() {
+            OptimoveLiveActivities.start(with: config)
+        }
+    }
+
+    static func getConfig() -> OptimoveConfig? {
+        return shared.config
+    }
+
+    /// The identified customer ID, or nil for an anonymous visitor.
+    static func currentCustomerId() -> String? {
+        return shared.container.resolve { $0.storage().customerID } ?? nil
+    }
+
+    /// The auth manager when `enableAuth` was used, otherwise nil.
+    static func currentAuthManager() -> AuthManager? {
+        return shared.container.resolve { $0.authManager } ?? nil
     }
 
     /// Set the credentials for the Optimove server. Intent to use as a step for the delayed initialization.
-    public static func setCredentials(optimoveCredentials: String?, optimobileCredentials: String?) {
+    private static func setCredentialsInternal(optimoveCredentials: String?, optimobileCredentials: String?, preferenceCenterCredentials: String? = nil, embeddedMessagingCredentials: String? = nil) {
         guard let currentConfig = shared.config else {
             Logger.error("Optimove SDK is not configured yet. Please call Optimove.initialize(with:) first.")
             return
         }
+
         let builder = OptimoveConfigBuilder(from: currentConfig)
-        builder.setCredentials(optimoveCredentials: optimoveCredentials, optimobileCredentials: optimobileCredentials)
+        builder.setCredentials(
+            optimoveCredentials: optimoveCredentials,
+            optimobileCredentials: optimobileCredentials,
+            preferenceCenterCredentials: preferenceCenterCredentials,
+            embeddedMessagingCredentials: embeddedMessagingCredentials
+        )
+
         let config = builder.build()
         initialize(with: config)
+    }
+   
+    public static func setCredentials(optimoveCredentials: String?, optimobileCredentials: String?) {
+        setCredentialsInternal(optimoveCredentials: optimoveCredentials, optimobileCredentials: optimobileCredentials)
+    }
+
+    public static func setCredentials(optimoveCredentials: String?, optimobileCredentials: String?, preferenceCenterCredentials: String?, embeddedMessagingCredentials: String? = nil) {
+        setCredentialsInternal(
+            optimoveCredentials: optimoveCredentials,
+            optimobileCredentials: optimobileCredentials,
+            preferenceCenterCredentials: preferenceCenterCredentials,
+            embeddedMessagingCredentials: embeddedMessagingCredentials
+        )
     }
 
     public static func isFeatureRunning(_ feature: Feature) -> Bool {
@@ -82,6 +148,10 @@ typealias Logger = OptimoveCore.Logger
             return Optimobile.isSdkRunning
         case .optimove:
             return RunningFlagsIndication.isSdkRunning
+        case .preferenceCenter:
+            return OptimovePreferenceCenter.isSdkRunning
+        case .embeddedMessaging:
+            return EmbeddedMessagesService.isSdkRunning
         default:
             return false
         }
@@ -359,6 +429,13 @@ public extension Optimove {
     @objc func application(_ application: UIApplication, continue userActivity: NSUserActivity, restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void) -> Bool {
         return Optimobile.application(application, continue: userActivity, restorationHandler: restorationHandler)
     }
+    
+    /**
+        Used for Deferred Deep Linking to pass the continuation url to the Optimove SDK to be processed.
+     */
+    @objc func urlOpened(url: URL) -> Bool {
+        return Optimobile.urlOpened(url: url)
+    }
 
     /**
         Used for Deferred Deep Linking to pass the continuation to the Optimove SDK to be processed in scene-based apps.
@@ -445,6 +522,11 @@ private extension Optimove {
             onStartEventGenerator.generate()
             let initializer = serviceLocator.initializer()
             initializer.initialize(with: configuration)
+            GamifyWidgetSDK.applyTenantConfiguration(
+                adactUrl: configuration.gamify?.adactUrl,
+                loyaltyWidgetUrl: configuration.gamify?.loyaltyWidgetUrl,
+                tenantId: configuration.tenantID
+            )
             RunningFlagsIndication.isInitializerRunning.toggle()
             RunningFlagsIndication.isSdkRunning.toggle()
         }

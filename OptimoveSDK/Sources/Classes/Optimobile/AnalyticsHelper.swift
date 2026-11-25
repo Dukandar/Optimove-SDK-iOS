@@ -2,6 +2,7 @@
 
 import CoreData
 import Foundation
+import OptimoveCore
 
 class KSEventModel: NSManagedObject {
     @NSManaged var uuid: String
@@ -18,16 +19,22 @@ final class AnalyticsHelper {
     private var analyticsContext: NSManagedObjectContext?
     private var migrationAnalyticsContext: NSManagedObjectContext?
     private var finishedInitializationToken: NSObjectProtocol?
+    private let serialQueue : DispatchQueue
 
     // MARK: Initialization
 
-    init(httpClient: KSHttpClient) {
+    /// - Parameter storeUrlOverride: Test-only hook to point the analytics store at a
+    ///   caller-controlled file instead of the app/shared-container path resolved by
+    ///   `initContext()`. When set, legacy-database migration is skipped since it only
+    ///   applies to the real on-device paths. Leave `nil` in production.
+    init(httpClient: KSHttpClient, storeUrlOverride: URL? = nil) {
         analyticsContext = nil
         migrationAnalyticsContext = nil
+        serialQueue = DispatchQueue(label: "com.optimove.optimobile.serial-q", target: .global(qos: .utility))
 
         eventsHttpClient = httpClient
 
-        initContext()
+        initContext(storeUrlOverride: storeUrlOverride)
 
         finishedInitializationToken = NotificationCenter.default
             .addObserver(forName: .optimobileInializationFinished, object: nil, queue: nil) { [weak self] notification in
@@ -74,7 +81,12 @@ final class AnalyticsHelper {
         return URL(string: "KAnalyticsDbShared.sqlite", relativeTo: sharedContainerPath)
     }
 
-    private func initContext() {
+    private func initContext(storeUrlOverride: URL? = nil) {
+        if let storeUrlOverride = storeUrlOverride {
+            analyticsContext = getManagedObjectContext(storeUrl: storeUrlOverride)
+            return
+        }
+
         let appDbUrl = getAppDbUrl()
         let appDbExists = appDbUrl == nil ? false : FileManager.default.fileExists(atPath: appDbUrl!.path)
         let appGroupExists = AppGroupsHelper.isKumulosAppGroupDefined()
@@ -149,9 +161,7 @@ final class AnalyticsHelper {
                 try context.save()
 
                 if immediateFlush {
-                    DispatchQueue.global().async {
-                        self.syncEvents(context: self.analyticsContext, onSyncComplete)
-                    }
+                    self.syncEvents(context: self.analyticsContext, onSyncComplete)
                 }
             } catch {
                 print("Failed to record event")
@@ -163,8 +173,14 @@ final class AnalyticsHelper {
     }
 
     private func syncEvents(context: NSManagedObjectContext?, _ onSyncComplete: SyncCompletedBlock? = nil) {
+        self.serialQueue.async {
+            self.syncEventsImpl(context: context, onSyncComplete)
+        }
+    }
+
+    private func syncEventsImpl(context: NSManagedObjectContext?, _ onSyncComplete: SyncCompletedBlock? = nil) {
         context?.performAndWait {
-            let results = fetchEventsBatch(context)
+            let results = fetchNextUserEventsBatch(context)
 
             if results.count == 0 {
                 onSyncComplete?(nil)
@@ -173,7 +189,8 @@ final class AnalyticsHelper {
                     removeAppDatabase()
                 }
             } else if results.count > 0 {
-                syncEventsBatch(context, events: results, onSyncComplete)
+                let batchUserId = results.first?.userIdentifier
+                syncEventsBatch(context, batchUserId: batchUserId, events: results, onSyncComplete)
                 return
             }
         }
@@ -204,7 +221,7 @@ final class AnalyticsHelper {
         migrationAnalyticsContext = nil
     }
 
-    private func syncEventsBatch(_ context: NSManagedObjectContext?, events: [KSEventModel], _ onSyncComplete: SyncCompletedBlock? = nil) {
+    private func syncEventsBatch(_ context: NSManagedObjectContext?, batchUserId: String?, events: [KSEventModel], _ onSyncComplete: SyncCompletedBlock? = nil) {
         var data = [] as [[String: Any?]]
         var eventIds = [] as [NSManagedObjectID]
 
@@ -226,17 +243,39 @@ final class AnalyticsHelper {
 
         let path = "/v1/app-installs/\(OptimobileHelper.installId)/events"
 
-        eventsHttpClient.sendRequest(.POST, toPath: path, data: data, onSuccess: { _, _ in
-            if let err = self.pruneEventsBatch(context, eventIds) {
-                print("Failed to prune events batch: " + err.localizedDescription)
+        // This is a workaround for not being able to differentiate between visitor and user events
+        // Visitor events are stamped with the installId as their userIdentifier
+        // Pass nil for visitor batches so the HTTP client skips JWT resolution.
+        let isVisitorBatch = (batchUserId == OptimobileHelper.installId)
+        let authUserId: String? = isVisitorBatch ? nil : batchUserId
+
+        var err : Error? = nil
+        let networkBarrier = DispatchSemaphore(value: 0)
+
+        eventsHttpClient.sendRequest(.POST, toPath: path, data: data, authUserId: authUserId, onSuccess: { _, _ in
+            networkBarrier.signal()
+        }) { _, error, _ in
+            err = error
+            print("Failed to send events \(err?.localizedDescription ?? "")")
+            networkBarrier.signal()
+        }
+
+        networkBarrier.wait()
+
+        if let err {
+            guard case .authNotConfigured? = err as? NetworkError else {
                 onSyncComplete?(err)
                 return
             }
-            self.syncEvents(context: context, onSyncComplete)
-        }) { _, error, _ in
-            print("Failed to send events")
-            onSyncComplete?(error)
         }
+
+        if let err = self.pruneEventsBatch(context, eventIds) {
+            print("Failed to prune events batch: " + err.localizedDescription)
+            onSyncComplete?(err)
+            return
+        }
+
+        self.syncEventsImpl(context: context, onSyncComplete)
     }
 
     private func pruneEventsBatch(_ context: NSManagedObjectContext?, _ eventIds: [NSManagedObjectID]) -> Error? {
@@ -255,20 +294,39 @@ final class AnalyticsHelper {
         return err
     }
 
-    private func fetchEventsBatch(_ context: NSManagedObjectContext?) -> [KSEventModel] {
+    /// Fetch the next batch of events for a single user.
+    ///
+    /// Peeks at the oldest queued event to determine which `userIdentifier` to drain next,
+    /// then returns up to 100 events for that user (oldest first).
+    /// Events for other users stay in the queue and will be picked up on the next sync cycle.
+    /// This ensures each HTTP request carries events for a single user
+    private func fetchNextUserEventsBatch(_ context: NSManagedObjectContext?) -> [KSEventModel] {
         guard let context = context else {
             return []
         }
 
-        let request = NSFetchRequest<KSEventModel>(entityName: "Event")
-        request.returnsObjectsAsFaults = false
-        request.sortDescriptors = [NSSortDescriptor(key: "happenedAt", ascending: true)]
-        request.fetchLimit = 100
-        request.includesPendingChanges = false
-
         do {
-            let results = try context.fetch(request)
-            return results
+            // Step 1: Peek at the oldest event to determine which userIdentifier to batch.
+            let peekRequest = NSFetchRequest<KSEventModel>(entityName: "Event")
+            peekRequest.returnsObjectsAsFaults = false
+            peekRequest.sortDescriptors = [NSSortDescriptor(key: "happenedAt", ascending: true)]
+            peekRequest.fetchLimit = 1
+            peekRequest.includesPendingChanges = false
+
+            let oldest = try context.fetch(peekRequest)
+            guard let firstEvent = oldest.first else {
+                return []
+            }
+
+            // Step 2: Fetch up to 100 events with the same userIdentifier, oldest first.
+            let batchRequest = NSFetchRequest<KSEventModel>(entityName: "Event")
+            batchRequest.returnsObjectsAsFaults = false
+            batchRequest.sortDescriptors = [NSSortDescriptor(key: "happenedAt", ascending: true)]
+            batchRequest.fetchLimit = 100
+            batchRequest.includesPendingChanges = false
+            batchRequest.predicate = NSPredicate(format: "userIdentifier == %@", firstEvent.userIdentifier)
+
+            return try context.fetch(batchRequest)
         } catch {
             print("Failed to fetch events batch: " + error.localizedDescription)
             return []

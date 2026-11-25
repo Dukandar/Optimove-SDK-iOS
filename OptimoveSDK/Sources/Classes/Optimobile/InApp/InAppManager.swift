@@ -42,7 +42,7 @@ class InAppManager {
         finishedInitializationToken = NotificationCenter.default
             .addObserver(forName: .optimobileInializationFinished, object: nil, queue: nil) { [weak self] notification in
                 guard let self = self else { return }
-                handleEnrollmentAndSyncSetup()
+                self.handleEnrollmentAndSyncSetup()
                 Logger.debug("Notification \(notification.name.rawValue) was processed")
             }
     }
@@ -213,6 +213,8 @@ class InAppManager {
     }
 
     private func resetMessagingState() {
+        presenter.cancelCurrentPresentationQueue(waitForViewCleanup: true)
+
         guard let context = messagesContext else {
             NSLog("InAppManager: NSManagedObjectContext is nil in resetMessagingState")
             return
@@ -279,7 +281,7 @@ class InAppManager {
             let encodedIdentifier = KSHttpUtil.urlEncode(OptimobileHelper.currentUserIdentifier)
             let path = "/v1/users/\(encodedIdentifier!)/messages\(after)"
 
-            self.httpClient.sendRequest(.GET, toPath: path, data: nil, onSuccess: { _, decodedBody in
+            self.httpClient.sendRequest(.GET, toPath: path, data: nil, authUserId: OptimobileHelper.associatedUserId, onSuccess: { _, decodedBody in
                 defer {
                     UserDefaults.standard.set(Date(), forKey: OptimobileUserDefaultsKey.IN_APP_LAST_SYNCED_AT.rawValue)
                     syncBarrier.signal()
@@ -455,12 +457,13 @@ class InAppManager {
 
         let messageExpiredCondition = "(expiresAt != nil AND expiresAt <= %@)"
 
-        let noInboxAndMessageDismissed = "(inboxConfig = nil AND dismissedAt != nil)"
+        let dismissGracePeriod = Date(timeIntervalSinceNow: -3600) as NSDate
+        let noInboxAndMessageDismissed = "(inboxConfig = nil AND dismissedAt != nil AND dismissedAt <= %@)"
         let noInboxAndMessageExpired = "(inboxConfig = nil AND " + messageExpiredCondition + ")"
         let inboxExpiredAndMessageDismissedOrExpired = "(inboxTo != nil AND inboxTo < %@ AND (dismissedAt != nil OR " + messageExpiredCondition + "))"
 
         let predicate: NSPredicate? =
-            NSPredicate(format: noInboxAndMessageDismissed + " OR " + noInboxAndMessageExpired + " OR " + inboxExpiredAndMessageDismissedOrExpired, NSDate(), NSDate(), NSDate())
+            NSPredicate(format: noInboxAndMessageDismissed + " OR " + noInboxAndMessageExpired + " OR " + inboxExpiredAndMessageDismissedOrExpired, dismissGracePeriod, NSDate(), NSDate(), NSDate())
         fetchRequest.predicate = predicate
 
         var toEvict: [InAppMessageEntity]

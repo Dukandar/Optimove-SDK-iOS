@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'OptimoveSDK'
-  s.version          = '5.6.0'
+  s.version          = '6.15.1'
   s.summary          = 'Official Optimove SDK for iOS.'
   s.description      = 'The Optimove SDK framework is used for reporting events and receive push notifications.'
   s.homepage         = 'https://github.com/optimove-tech/Optimove-SDK-iOS'
@@ -9,12 +9,16 @@ Pod::Spec.new do |s|
   s.source           = { :git => 'https://github.com/optimove-tech/Optimove-SDK-iOS.git', :tag => s.version.to_s }
   s.social_media_url = 'https://twitter.com/Optimove'
   s.platform = 'ios'
-  s.ios.deployment_target = '10.0'
+  s.ios.deployment_target = '11.0'
   s.visionos.deployment_target = "1.0"
   # s.static_framework = true
   s.swift_version = '5'
   base_dir = "OptimoveSDK/"
   s.source_files = base_dir + 'Sources/Classes/**/*', 'OptimobileShared/**/*'
+  s.resource_bundles = {
+    'OptimoveSDK' => ['OptimoveSDK/PrivacyInfo.xcprivacy']
+  }
   s.dependency 'OptimoveCore', s.version.to_s
   s.frameworks = 'Foundation', 'UIKit', 'SystemConfiguration', 'UserNotifications', 'CoreData'
+  s.weak_frameworks = 'ActivityKit'
 end

@@ -8,11 +8,15 @@ public protocol NetworkClient {
     func perform(_ request: NetworkRequest, _ completion: @escaping NetworkServiceCompletion)
 }
 
-public struct NetworkClientImpl {
+public final class NetworkClientImpl {
     let session: URLSession
 
     public init(configuration: URLSessionConfiguration = URLSessionConfiguration.default) {
         session = URLSession(configuration: configuration)
+    }
+    
+    deinit {
+        session.finishTasksAndInvalidate()
     }
 }
 
@@ -49,6 +53,10 @@ extension NetworkClientImpl: NetworkClient {
 
         request.headers?.forEach { urlRequest.addValue($0.value, forHTTPHeaderField: $0.field) }
 
+        // Signal that this SDK version supports auth.
+        urlRequest.addValue("1", forHTTPHeaderField: "X-Optimove-Auth-Capable")
+        urlRequest.addValue("ios", forHTTPHeaderField: "X-Optimove-Platform")
+
         let task = session.dataTask(with: urlRequest) { data, response, error in
             if let error = error {
                 completion(.failure(NetworkError.error(error)))
@@ -61,7 +69,9 @@ extension NetworkClientImpl: NetworkClient {
             switch httpResponse.statusCode {
             case 200 ... 299:
                 completion(.success(NetworkResponse<Data?>(statusCode: httpResponse.statusCode, body: data)))
-            case 400 ... 499:
+            case 401:
+                completion(.failure(NetworkError.unauthorized(data)))
+            case 400, 402 ... 499:
                 completion(.failure(NetworkError.requestInvalid(data)))
             case 500 ... 599:
                 completion(.failure(NetworkError.requestFailed))
